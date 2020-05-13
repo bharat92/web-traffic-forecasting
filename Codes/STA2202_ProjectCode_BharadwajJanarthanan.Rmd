@@ -1,0 +1,1323 @@
+---
+title: "STA 2202- Time Series Analysis- Graduate Project"
+author: "Bharadwaj Janarthanan | bharadwaj@cs.toronto.edu | 1005068720 "
+date: "20 December 2018"
+output: html_document
+---
+
+To run this code we would need the following packages installed (if not already installed on system)    
+
+1. Rssa  
+2. Keras (https://keras.rstudio.com/, Check link for installation) 
+```
+install.packages("keras")
+install_keras() 
+```
+3. data.table 
+4. parallel  
+5. fpp  
+6. tidyverse  
+
+_Note:The code takes about 8 hours to complete a run on a system with 16 GB RAM, i7-8th Gen processor and Nvidia GeForce GTX 1050Ti, 4GB GPU for the entire data._    
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE,message = FALSE,warning = FALSE)
+#Change working directory if it is not the current working directory
+#knitr::opts_knit$set(root.dir = './')
+#Load Required libraries
+require(Rssa)
+require(fpp)
+require(tidyverse)
+require(data.table)
+require(parallel)
+require(keras)
+#Calculating SMAPE
+smape <- function(act, pred){ 
+  sm <- 200 * abs(act - pred) / (abs(act) + abs(pred))
+  sm <- ifelse(is.na(act), NA,sm)   
+  sm <- ifelse(is.na(pred) & !is.na(act), 200,sm)     
+  sm <- ifelse(pred==0 & act==0, 0,sm)
+  return (sm) 
+}
+mape <- function(act, pred){ 
+  pred<-ifelse(pred<0,0,pred)
+  mape <- abs(act - pred) / act
+  return (ifelse(act==0,0,mape)) 
+}
+```
+
+##Importing Web Traffic Data- Wikipedia Pages
+
+This section includes modules to import Wikpedia pages daily views data. It then identifies page attributes and separates it out from the data.
+
+```{r}
+filename<-"./train_englishWiki.csv"
+#Import Web Traffic Data
+web_data<-read.table(filename,header=TRUE,stringsAsFactors = FALSE,sep=",")
+web_data$X<-NULL
+colnames(web_data)[1]<-str_to_lower(colnames(web_data)[1])
+web_data<-web_data[web_data$page %like% "en.wikipedia.org",]
+setDT(web_data)
+
+#Split page to access/agent/location/page name
+
+web_data[,webcode:=as.character(page)]
+
+#Agent
+web_data[,agent:=str_extract(page,"\\_([:alpha:]|\\-)*$")]
+web_data[,page:=str_remove_all(page,agent)]
+web_data[,agent:=str_replace_all(agent,"\\_","")]
+
+#Access
+web_data[,access:=str_extract(page,"\\_([:alpha:]|\\-)*$")]
+web_data[,page:=str_remove_all(page,access)]
+web_data[,access:=str_replace_all(access,"\\_","")]
+
+#Location
+web_data[,location:=str_extract(page,"((\\_www.mediawiki.org)|(\\_commons\\.wikimedia\\.org)|(\\_([:alpha:]){0,2}\\.wikipedia\\.org))$")]
+web_data[,page:=str_remove_all(page,location)]
+web_data[,location:=str_replace_all(location,"\\_","")]
+
+#Store Characteristic information in separate dataset
+web_info_data<-data.table(unique(data.frame(web_data[,.(webcode,page,agent,access,location)])))
+
+#Remove all the characteristic information from the web series data
+web_data[,`:=`(page=NULL,agent=NULL,access=NULL,location=NULL)]
+
+#Melt data to Page X Daily format
+web_data<-as.data.table(melt(web_data,id=c("webcode")))
+colnames(web_data)<-str_to_lower(colnames(web_data))
+
+#Column format
+web_data[,date:=as.character(variable)]
+web_data[,date:=str_replace_all(date,"X","")]
+web_data[,date:=as.Date(date,format="%Y.%m.%d")]
+web_data[,pageviews:=as.numeric(value)]
+web_data[,`:=`(variable=NULL,value=NULL)]
+
+save(web_info_data,file="./ENG_Web_Attributes.RData")
+save(web_data,file="./ENG_Web_PageViews_WebPageXDate.RData")
+```
+
+##Exploratory Data Analysis
+
+This section contains modules to perform a few basic exploratory analysis on wikipedia page daily hits, to understand the variations in data better. Some of the analyses here are inspired from the views in,   https://tools.wmflabs.org/pageviews/?project=en.wikipedia.org&platform=all-access&agent=user&range=latest-20&pages=Cat|Dog  
+
+A lot more information on traffic analysis can be found at, https://meta.wikimedia.org/wiki/Pageviews_Analysis  
+
+Articles/Pages spike in traffic because of,  
+1. Media Attention  
+2. Time of the year  
+3. Bots/ Spider crawling through the pages  
+and so on...  
+
+**Missing Data:**
+Around 6% of the total webpage hits per day are missing. For our analysis, since the sit doesn't provide us information if there was no hits on the page that day or that the data is missing, we will treat missing information as, no hits too.  
+
+Note: If there's time a missing data imputation technique would be tried out to see how that improves the model performance.  
+
+```{r}
+#Finding Missing Data
+sum(is.na(web_data$pageviews))/(nrow(web_data))
+```
+
+**Web Agents:**
+
+This bar chart shows, the traffic distribution from different agents and as can be seen, most of the traffic is from agents with about 24% traffic coming in from spider. Do note that the traffic coming in from spider will be volatile and have sudden spikes unlike traffic from agents.
+
+```{r}
+ggplot(data=web_info_data)+
+  aes(x=agent)+
+  geom_bar(fill="#0066CC")+
+  xlab("Accessed By Agent")+
+  ylab("# of Sites")
+  
+```
+
+**Web Access:**
+
+Most pages are accessed from all device types. However, there seems to be more traffic from mobile-web devices than desktop.  
+
+```{r}
+ggplot(data=web_info_data)+
+  aes(x=access)+
+  geom_bar(fill="#0066CC")+
+  xlab("Device Type")+
+  ylab("# of sites")
+```
+
+**Overall Web Traffic Time Series Plot:**
+
+```{r}
+#Summarise Web Page Traffic- Overall
+web_daily_summary_dat<-web_data%>%
+  group_by(date)%>%
+  summarise(avg_webviews=mean(pageviews,na.rm=TRUE),
+            median_webviews=median(pageviews,na.rm=TRUE),
+            sd_webviews=sd(pageviews,na.rm=TRUE),
+            no_webpages=n_distinct(webcode),
+            total_webviews=sum(pageviews,na.rm=TRUE))%>%
+  mutate(year=year(date))
+
+save(web_daily_summary_dat,file="./ENG_WebTraffic_Overall_Daily_Summary.RData")
+rm(web_daily_summary_dat)
+```
+
+**Plot of overall web traffic data summary:**   
+
+```{r}
+load("./ENG_WebTraffic_Overall_Daily_Summary.RData")
+inds <- seq(as.Date("2015-07-01"), as.Date("2017-09-10"), by = "day")
+web_daily_ts_summary_dat<-ts(data.matrix((web_daily_summary_dat[,2:3])),frequency = 365,start=c(2015,as.numeric(format(inds[1], "%j"))))
+autoplot(web_daily_ts_summary_dat,xlab="Day",ylab="# of hits per page")
+```
+
+The above plot shows, the median vs average page hits in a day for all provided Wikipedia data and as can be seen, the medians are not as varying as the averag hits per page, which means a large number of Wikipedia pages seem to have a very strong pattern (Trend, Seasonality) to their hits/views. However, some pages experience sudden spike in traffic and this spikes up the overall page hits. Plotting the variation in traffic in a day across pages shows, how different are the traffic across wikipedia pages.  
+
+**Plot of standard deviation in webpage views in a day:**    
+
+```{r web_daily_summary_dat}
+web_daily_ts_summary_dat<-ts(data.matrix((web_daily_summary_dat[,4])),frequency = 365,start=c(2015,as.numeric(format(inds[1], "%j"))))
+autoplot(web_daily_ts_summary_dat,xlab="Day",ylab="Std. Dev. of # of hits per page")
+```
+
+As can be seen, the web-traffic data across page are quite different, with some of those pages with extreme highly traffic  
+
+**Decomposition of Overall Traffic Data:**
+
+Before decomposing the overall web-traffic data, we need to check if the data is stationary using a KPSS test,  
+
+```{r}
+web_daily_avg_ts_summary_dat<-ts(data.matrix(log1p(web_daily_summary_dat[,2])),frequency = 365,start=c(2015,as.numeric(format(inds[1], "%j"))))
+kpss.test(web_daily_avg_ts_summary_dat,null="Trend")
+```
+
+As can be seen, the overall log transformed avg. web traffic data is not stationary, since p-value is significant and the null hypothesis of the stationarity of error with linear trend is rejected.  
+
+We need difference the series data to make it stationary, 
+
+```{r }
+#Number of differencing required
+reg_diff_no<-ndiffs(web_daily_avg_ts_summary_dat)
+stationary_web_traffic_daily_avg_ts_summary_dat <- diff(web_daily_avg_ts_summary_dat, differences= reg_diff_no)
+autoplot(stationary_web_traffic_daily_avg_ts_summary_dat,ylab="Differenced avg. webpage views",xlab="Day")
+kpss.test(stationary_web_traffic_daily_avg_ts_summary_dat,null="Trend")
+```
+
+After differencing, it can be observed, that the data is trend stationary.
+
+**Decompose the data: trend, seasonal and error component**  
+```{r}
+autoplot(stl(stationary_web_traffic_daily_avg_ts_summary_dat[,1],s.window ="periodic"))
+```
+
+There's more seasonal and irregular component than trend in overall avg. web page view  
+
+Now, doing the same with the median web page views,  
+
+```{r}
+web_daily_median_ts_summary_dat<-ts(data.matrix(log1p(web_daily_summary_dat[,3])),frequency = 365,start=c(2015,as.numeric(format(inds[1], "%j"))))
+#kpss.test(web_daily_median_ts_summary_dat,null="Trend")
+#Number of differencing required
+reg_diff_no<-ndiffs(web_daily_avg_ts_summary_dat)
+stationary_web_traffic_daily_median_ts_summary_dat <- diff(web_daily_median_ts_summary_dat, differences= reg_diff_no)
+autoplot(stationary_web_traffic_daily_median_ts_summary_dat,ylab="Differenced median webpage views",xlab="Day")
+#kpss.test(stationary_web_traffic_daily_median_ts_summary_dat,null="Trend")
+autoplot(stl(stationary_web_traffic_daily_median_ts_summary_dat[,1],s.window ="periodic"))
+```
+
+We observe the same as what was observed with avg.webpage views.  
+
+**Distribution of Web Traffic Plots:**
+```{r}
+web_page_summary_dat<-web_data%>%
+  group_by(webcode)%>%
+  summarise(avg_dailyviews=mean(pageviews,na.rm=TRUE),
+            median_dailyviews=median(pageviews,na.rm=TRUE),
+            max_dailyviews=max(pageviews,na.rm=TRUE),
+            sdbymean_dailyviews=sd(pageviews,na.rm=TRUE)/mean(pageviews,na.rm=TRUE))
+setDT(web_page_summary_dat)
+web_page_summary_dat<-web_page_summary_dat[!is.na(web_page_summary_dat$avg_dailyviews),]
+
+save(web_page_summary_dat,file="./ENG_WebPage_Summary_Views.RData")
+rm(web_page_summary_dat)
+```
+
+**Distribution of web views:**   
+```{r}
+load(file="./ENG_WebPage_Summary_Views.RData")
+plot_dat<-melt(web_page_summary_dat[web_page_summary_dat$avg_dailyviews>0,],id="webcode")
+ggplot(data = plot_dat)+
+  aes(x=log1p(value))+
+  geom_histogram()+
+  facet_wrap(~variable,scales="free")+
+  xlab("Page hits/Views")+
+  ylab("# of pages")+
+  ggtitle("Distribution of pages")
+rm(plot_dat)
+```
+
+As can be seen, most web pages, have about 3000 web views per day on an average, with a SD/Mean ratio much less than 1 as can be seen the distribution is right skewed.  
+
+**Web Agent:**
+
+```{r}
+agent<-unique(web_info_data$agent)
+web_agent_summary_dat<-data.frame()
+for (x in agent){
+ pages<-unique(web_info_data$webcode[web_info_data$agent==x])
+ setDT(web_data)
+ web_temp_dat<-web_data[webcode %in% pages,]
+ colnames(web_temp_dat)<-c("webcode","date","pageviews")
+web_temp_dat<-web_temp_dat%>%
+    group_by(date)%>%
+    summarise(avg_dailyviews=mean(pageviews,na.rm=TRUE),
+              median_dailyviews=median(pageviews,na.rm=TRUE),
+              max_dailyviews=max(pageviews,na.rm=TRUE),
+              sdbymean_dailyviews=sd(pageviews,na.rm=TRUE)/mean(pageviews,na.rm=TRUE))
+  web_temp_dat$agent<-x
+  web_agent_summary_dat<-rbind(web_agent_summary_dat,web_temp_dat)
+}
+rm(web_temp_dat)
+
+save(web_agent_summary_dat,file="./ENG_WebAgent_Summary_Views.RData")
+
+plot_dat<-melt(web_agent_summary_dat,id=c("date","agent"))
+ggplot(data =plot_dat[as.character(plot_dat$variable)=="avg_dailyviews",] )+
+  aes(x=date,y=value,colour=agent)+
+  geom_line()+
+  theme(legend.position = "top")+
+  ggtitle("Web Agent Series")+
+  xlab("Date")+
+  ylab("Avg. # of Page hits/ views")
+rm(plot_dat)
+
+```
+
+As can be observed from the graphs,though the traffic from spider is more sporadic and doesn't follow any particular pattern  
+
+**Web Access:**
+
+```{r}
+access<-unique(web_info_data$access)
+web_acess_summary_dat<-data.frame()
+for (x in access){
+ pages<-unique(web_info_data$webcode[web_info_data$access==x])
+ setDT(web_data)
+ web_temp_dat<-web_data[webcode %in% pages,]
+web_temp_dat<-web_temp_dat%>%
+    group_by(date)%>%
+    summarise(avg_dailyviews=mean(pageviews,na.rm=TRUE),
+              median_dailyviews=median(pageviews,na.rm=TRUE),
+              max_dailyviews=max(pageviews,na.rm=TRUE),
+              sdbymean_dailyviews=sd(pageviews,na.rm=TRUE)/mean(pageviews,na.rm=TRUE))
+  web_temp_dat$access<-x
+  web_acess_summary_dat<-rbind(web_acess_summary_dat,web_temp_dat)
+}
+rm(web_temp_dat)
+
+save(web_acess_summary_dat,file="./ENG_WebAcess_Summary_Views.RData")
+
+plot_dat<-melt(web_acess_summary_dat,id=c("date","access"))
+ggplot(data =plot_dat[as.character(plot_dat$variable)=="avg_dailyviews",] )+
+  aes(x=date,y=value,colour=access)+
+  geom_line()+
+  theme(legend.position = "top")+
+  ggtitle("Web Access Series")+
+  xlab("Date")+
+  ylab("# of Page hits/ views")
+rm(plot_dat)
+```
+
+Traffic from different devices are mostly similar with desktop volume higher than mobile-web  
+
+**Top 10 Webpage Traffic:**
+```{r}
+load("./ENG_WebPage_Summary_Views.RData")
+top10_webpages<-head(web_page_summary_dat$webcode[order(-web_page_summary_dat$avg_dailyviews)],10)
+
+plot_dat<-web_data[web_data$webcode %in% top10_webpages,]
+plot_dat[,pageviews:=as.numeric(pageviews)]
+ggplot(plot_dat)+
+  aes(x=date,y=pageviews,colour=webcode)+
+  geom_line()+
+  theme(legend.position = "top")+
+guides(colour=guide_legend(nrow=5))
+```
+
+As can be seen Main page traffics are higher than any other wikipages and around 2016, July there's been a spike in visits on web pages.  
+
+##Conclusion:
+Based on our above exploratory analysis, we see that wikipedia pages largely have steady state visits per day, with ocassional spikes which could be related to a number of events such as web crawling or media events etc. Also, traffic for the same page from one type of agent/access is comparable to another.  
+
+We will need to explore modelling for time series data in high dimensional spaces, leveraging both spatial and temporal correlations in the multivariate system.  
+
+As a reasonable baseline,we built a univariate ARIMA model for each traffic view, totalling to 24,000 models approx., whose performance is used as a baseline to benchmark results from our different approaches.  
+
+--------------------------------------------------------------------------------------------------------------------
+
+#Baseline Modelling:
+
+##Batch Splitting:
+
+We split the entire Web data into batches of 2418 series to run ARIMA models in parallel across them.  
+
+```{r}
+load("./ENG_Web_PageViews_WebPageXDate.RData")
+web_data<-web_data%>%
+  spread(date,pageviews)
+web_data$parallel_grp<-rep(1:60,394)[1:nrow(web_data)]
+for(group in unique(web_data$parallel_grp)){
+  #print(group)
+  web_data_filter<-web_data[web_data$parallel_grp==group,]
+  save(web_data_filter,file=paste("./batch_web_data_",group,".RData",sep=""))
+}
+```
+
+##Running ARIMA Models in Parallel:
+
+Note: This section of code was run on a Linux computing server with 64 Core and 256 GB of RAM for speed.  
+
+```{r}
+batch_files<-list.files("./")
+batch_files<-batch_files[batch_files %like% "batch_web_data"]
+# no_cores <- 1
+no_cores<-detectCores()-2
+for(filename in batch_files){
+
+  load(file=paste("./",filename,sep=""))
+  
+  predict_parallel_fn<-function(page){
+    err<-data.frame()
+    tryCatch({
+    
+    page_dat<-web_data_filter[web_data_filter$webcode==page,]
+    page_dat<-melt(page_dat,id="webcode")
+    colnames(page_dat)<-c("webcode","date","pageviews")
+    setDT(page_dat)
+    page_dat[,date:=as.character(date)]
+    page_dat[,date:=str_replace_all(date,"X","")]
+    page_dat[,date:=as.Date(date,format="%Y.%m.%d")]
+    page_dat[,pageviews:=as.numeric(pageviews)]
+    
+    time_series<-ts(log1p(page_dat$pageviews),frequency = 365)
+    train_series<-(time_series)[1:(length(time_series)-64)]
+    test_series<-(time_series)[(length(time_series)-63):length(time_series)]
+    overall_model<-auto.arima(train_series,trace = FALSE)
+    order<-paste(overall_model$arma,collapse=" ")
+    pred <- forecast(overall_model,h=64)
+    
+    err<-cbind(order,
+    mean(smape(expm1(train_series),expm1(overall_model$fitted)),na.rm=TRUE),
+    page,
+    mean(smape(expm1(test_series),expm1(as.numeric(pred$mean))),na.rm=TRUE))
+    colnames(err)<-c("order","train_smape","webpage","test_smape")
+  
+    rm(page_dat,time_series,train_series,test_series,dates,pred,overall_model,order)
+    },error=function(e){cat("ERROR :",conditionMessage(e), "\n")})
+    return(err)
+}
+  
+  results<-mclapply(unique(web_data_filter$webcode),predict_parallel_fn,mc.cores =no_cores)
+  resultscombined <-do.call(rbind,results)
+  rm(results)
+  
+  save(resultscombined,file=paste("./All_ARIMA_Models_",filename,sep=""))
+}
+```
+
+##Baseline Model Performance
+
+Model was validated on last 64 days of data and the remaining was used for model training  
+
+```{r}
+model_results_files<-list.files("./")
+model_results_files<-model_results_files[model_results_files %like% "All_ARIMA_Models"]
+arima_model_results_file<-data.frame()
+for(filename in model_results_files){
+  #print(filename)
+  filename<-paste0("./",filename)
+  load(file=filename)
+  arima_model_results_file<-rbind(arima_model_results_file,resultscombined)
+}
+arima_model_results_file$order<-as.character(arima_model_results_file$order)
+arima_model_results_file$webpage<-as.character(arima_model_results_file$webpage)
+arima_model_results_file$train_smape<-as.numeric(as.character(arima_model_results_file$train_smape))
+arima_model_results_file$test_smape<-as.numeric(as.character(arima_model_results_file$test_smape))
+save(arima_model_results_file,file="./ARIMA_Models_AllPage_Results.RData")
+```
+
+**Plotting Distribution of train and test SMAPE for ARIMA models:**    
+```{r}
+load("./ARIMA_Models_AllPage_Results.RData")
+arima_model_results_file<-arima_model_results_file[arima_model_results_file$webpage %like% "en.wikipedia.org",]
+plot_dat<-arima_model_results_file[,c("webpage","train_smape","test_smape")]
+plot_dat<-melt(plot_dat,id="webpage")
+ggplot(plot_dat[plot_dat$variable=="test_smape",])+
+  aes(x=value)+
+  geom_histogram(fill="#0066CC")+
+  xlab("Avg. SMAPE for forecast horizon=64 days")+
+  ylab("# of pages")
+
+#Train SMAPE
+mean(arima_model_results_file$train_smape,na.rm=TRUE)
+#Test SMAPE
+mean(arima_model_results_file$test_smape,na.rm=TRUE)
+
+#Train SMAPE
+median(arima_model_results_file$train_smape,na.rm=TRUE)
+#Test SMAPE
+median(arima_model_results_file$test_smape,na.rm=TRUE)
+```
+
+As can be seen both the train and test SMAPE distributions are right skewed with the avg. SMAPE being 26.20% for train and 40.54% for test.  
+
+We would now compare our results from this model against our approaches. Do note that, building this kind of model would require us to evaluate and maintain performances of 24k models approximately for the given dataset.   
+
+**Plotting for the top 5 web pages:**   
+```{r}
+inds <- seq(as.Date("2015-07-01"), as.Date("2017-09-10"), by = "day")
+arima_forecast_dat<-data.frame()
+load(file="./ENG_WebPage_Summary_Views.RData")
+#Uncomment this code to check actual vs forecast for pages that are not main/special and accessed by non-spider agents from any device
+# web_page_summary_dat<-web_page_summary_dat[!web_page_summary_dat$webcode %like% "Main" &
+#                                              !web_page_summary_dat$webcode %like% "Special" &
+#                                              web_page_summary_dat$webcode %like% "all-access" &
+#                                              web_page_summary_dat$webcode %like% "all-agent", ]
+top10_webcode<-head(web_page_summary_dat$webcode[order(-web_page_summary_dat$median_dailyviews)],5)
+
+for(page in top10_webcode){
+  webpage_data<-web_data[web_data$webcode==page,]
+  time_series<-ts(log1p(simplify(webpage_data[,2:(ncol(webpage_data)-2)])),frequency = 365)
+  train_series<-(time_series)[1:(length(time_series)-64)]
+  test_series<-(time_series)[(length(time_series)-63):length(time_series)]
+  overall_model<-auto.arima(train_series,trace = FALSE)
+  pred <- forecast(overall_model,h=64)$mean
+  predicted_series<-ts(c(rep(NA,739),pred),frequency=365)
+  arima_forecast<-cbind(time_series,predicted_series)
+  arima_forecast<-data.frame(arima_forecast)
+  arima_forecast$page<-page
+  arima_forecast$date<-inds
+  arima_forecast_dat<-rbind(arima_forecast_dat,arima_forecast)
+}
+plot_dat<-melt(arima_forecast_dat,id=c("page","date"))
+ggplot(data=plot_dat[plot_dat$date>="2017-01-01",])+
+  aes(x=date,y=expm1(value)/1000000,colour=variable)+
+  geom_line()+
+  scale_color_manual(values=c("light blue","dark green"))+
+  facet_wrap(~page,scales = "free")+
+  xlab("Year of 2017-Daily View")+
+  ylab("# of hits per day, in millions")+
+  ggtitle("Actual vs Predicted- For top10 WebTraffic Series using ARIMA")+
+  theme(legend.position = "bottom")
+
+```
+
+As can been observed the ARIMA models, fit well, when the series has a clear trend pattern. However,in series with extreme fluctuations the prediction just returns flat average.  
+
+#Experiments:
+
+##Singular Spectrum Analysis and Convolutional Networks:
+
+In this experiment, we will explore using SSA and CNN for forecasting with multivariate high demnsional time series data 
+
+We will include the median web views across, different agents, access and locales as additional series into the data, so that the model will account for inherent differences in traffic flow across these types  
+```{r}
+load(file="./ENG_WebAcess_Summary_Views.RData")
+load(file="./ENG_WebAgent_Summary_Views.RData")
+load(file="./ENG_Web_PageViews_WebPageXDate.RData")
+
+web_agent_dat<-web_agent_summary_dat[,c("agent","date","median_dailyviews")]
+web_agent_dat<-web_agent_dat[!is.na(web_agent_dat$date),]
+web_agent_dat<-web_agent_dat%>%spread(date,median_dailyviews)
+
+web_access_dat<-web_acess_summary_dat[,c("access","date","median_dailyviews")]
+web_access_dat<-web_access_dat[!is.na(web_access_dat$date),]
+web_access_dat<-web_access_dat%>%spread(date,median_dailyviews)
+
+
+web_data<-web_data%>%
+  filter(!is.na(date))%>%
+  spread(date,pageviews)
+
+colnames(web_data)[2:ncol(web_data)]<-colnames(web_agent_dat)[2:ncol(web_agent_dat)]
+colnames(web_agent_dat)<-colnames(web_data)
+colnames(web_access_dat)<-colnames(web_data)
+
+#Combining all the series data together
+
+web_data<-rbind(web_data,web_agent_dat,web_access_dat)
+
+#Reformatting data for feed into SSA
+webpage<-unique(web_data$webcode)
+webpage<-sort(webpage)
+id<-1:nrow(web_data)
+names(webpage)<-paste0("web_",ifelse(id<10,paste0("0",id),id))
+save(webpage,file="./WebPageOrder.RData")
+
+web_data<-web_data%>%
+  gather(key=date,value=pageviews,-webcode)%>%
+  mutate(web_id=paste0("web_",ifelse(match(webcode,webpage)<10,paste0("0",match(webcode,webpage)),
+                                     match(webcode,webpage))))%>%
+  mutate(webcode=NULL)%>%
+  spread(web_id,pageviews)
+rm(web_access_dat,web_agent_dat)
+rm(web_acess_summary_dat,web_agent_summary_dat,web_page_summary_dat)
+save(web_data,file="./SSA_WebTraffic_Format_DateXPage.RData")
+```
+
+##Preparing for model iteration:
+
+Log-transform data and remove pages with a large number of missing values more than 70%  
+
+```{r}
+load(file="./SSA_WebTraffic_Format_DateXPage.RData")
+#Log transform variables, so that we remove effect of scales across traffics between low and high traffic pages
+web_data[web_data==0]<-NA
+web_data[,2:ncol(web_data)]<-log1p(web_data[,2:ncol(web_data)])
+
+#Remove Pages with more than 70% of the  data missing i.e, less than a year of information
+#About 2% of webtraffic data is removed-these are mostly same page traffic-diff access/agents
+pages_to_remove<-colnames(web_data)[which(colMeans(is.na(web_data)) > 0.70)]
+pages_to_remove_sites<-webpage[names(webpage) %in% pages_to_remove]
+save(pages_to_remove_sites,file="./RemovedWebPages_ForSSA.RData")
+
+web_data<-web_data[,colnames(web_data)[!colnames(web_data) %in% pages_to_remove]]
+rm(pages_to_remove_sites,pages_to_remove)
+save(web_data,file="./SSA_WebTraffic_Format_DateXPage_MissingRemoved.RData")
+```
+
+##Modelling module:
+
+###CNN Only Model:
+
+This function is used to run a CNN only model on the data,  
+
+```{r}
+cnn_model<-function(data,start_period,end_period,pred_window){
+set.seed(123)
+global_inds<-seq(as.Date("2015-07-01"), as.Date("2017-09-10"), by = "day")  
+data<-data[match(start_period,global_inds):match(end_period,global_inds),]
+
+pages_to_remove<-colnames(data)[which(colMeans(is.na(data)) > 0.70)]
+data<-data[,colnames(data)[!colnames(data) %in% pages_to_remove]]
+data<-na.locf(data)
+
+inds <- seq(start_period,end_period, by = "day")
+test_dat<-data[match(end_period,inds)-((pred_window-1):0),]
+train_dat<-data[match(start_period,inds):(match(end_period,inds)-pred_window),]
+rm(global_inds)
+
+vaidate_pred_end<-end_period
+vaidate_pred_start<-vaidate_pred_end-(pred_window-1)
+
+train_pred_end<-vaidate_pred_start-1
+train_pred_start<-train_pred_end-(pred_window-1)
+
+train_start<-start_period
+train_end<-train_pred_start-1
+
+validate_start<-train_start+(pred_window-1)
+validate_end<-train_end+(pred_window-1)
+
+train_res_dat<-train_dat[match(train_start,inds):match(train_end,inds),]
+mean <- colMeans(train_res_dat)
+std <- apply(train_res_dat, 2, sd)
+train_res_dat <- scale(train_res_dat, center = mean, scale = std)
+train_res_dat[is.na(train_res_dat)]<-0
+
+test_res_dat<-train_dat[match(train_pred_start,inds):match(train_pred_end,inds),]
+test_res_dat <- scale(test_res_dat, center = mean, scale = std)
+test_res_dat[is.na(test_res_dat)]<-0
+
+validate_input_res_dat<-train_dat[match(validate_start,inds):match(validate_end,inds),]
+validate_input_res_dat <- scale(validate_input_res_dat, center = mean, scale = std)
+validate_input_res_dat[is.na(validate_input_res_dat)]<-0
+
+encoder_input_data <-train_res_dat
+decoder_target_data<-test_res_dat
+
+encoder_input_data<-cbind(t(encoder_input_data),t(decoder_target_data[1:(nrow(decoder_target_data)),]))
+
+encoder_input_data<-array(t(encoder_input_data),dim=c(nrow(encoder_input_data),ncol(encoder_input_data),1))
+decoder_target_data<-array(t(decoder_target_data),dim=c(ncol(decoder_target_data),nrow(decoder_target_data),1))
+
+
+k_clear_session()
+n_filters<-32
+filter_width<-7
+dilation_rates<-2**(0:8)
+
+history_seq<-layer_input(shape=list(NULL,1))
+x<-history_seq
+
+for(dilation in dilation_rates){
+  x<-x%>%
+    layer_conv_1d(filters = n_filters,
+                   kernel_size = filter_width,
+                   padding='causal',
+                   dilation_rate = dilation)
+}
+x<-x%>%
+  layer_dense(units=256, activation='selu')
+x<-x%>%
+  layer_dropout(0.2)
+x<-x%>%
+  layer_dense(1)
+
+slice<-function(input,pred_window){
+  return(input[,-pred_window:-1,])
+}
+train_pred_seq<-x%>%
+  layer_lambda(slice,arguments=list('pred_window'=(pred_window)))
+
+model<-keras_model(history_seq,train_pred_seq)
+#summary(model)
+
+gc()
+batch_size<-256
+epochs<-2000
+
+optimize_fn<-optimizer_adam(lr=0.001)
+k_smape_loss<-function(y_true, y_pred){
+  return (k_mean(k_clip(k_abs(y_pred - y_true),0.0,1.0),axis=-1))
+}
+model %>% compile(optimizer=optimize_fn,
+                  loss=k_smape_loss)
+
+history<-model %>% fit(encoder_input_data,decoder_target_data,
+                        batch_size=batch_size,
+                        epochs=epochs,
+                        validation_split=0.3,callbacks =list(
+                          callback_early_stopping(monitor="val_loss",patience=10)))
+
+export_savedmodel(model,
+                  export_dir_base = paste0("./saveOnlyCNNModel_Final_",start_period,"_",end_period),
+                  remove_learning_phase = FALSE)
+
+#Predict 64 days ahead with the current ensembled model
+pred_fn<-function(model,input_seq){
+  pred_seq<-array(dim=c(nrow(input_seq),(pred_window),1))
+  for(step in 1:(pred_window)){
+    predict_step<-predict(model,input_seq)
+    predict_step<-predict_step[,ncol(predict_step),]
+    predict_step<-array(predict_step,dim=c(length(predict_step),1,1))
+    pred_seq[,step,] <- predict_step
+    input_seq<-input_seq[,,1]
+    predict_step<-predict_step[,,1]
+    input_seq<-cbind(input_seq,predict_step)
+    input_seq<-array(input_seq,dim=c(nrow(input_seq),ncol(input_seq),1))
+  }
+  return(pred_seq)
+}
+
+validation_pred_seq<-pred_fn(model,encoder_input_data)
+
+
+nn_forecast_dat<-data.frame(t((validation_pred_seq[,,1]*std)+mean))
+colnames(nn_forecast_dat)<-colnames(train_dat)
+nn_forecast_dat$date<-inds[length(inds)-((pred_window-1):0)]
+nn_forecast_dat<-melt(nn_forecast_dat,id=c("date"))
+colnames(nn_forecast_dat)<-c("date","web_page","page_views_nn")
+nn_forecast_dat$web_page<-as.character(nn_forecast_dat$web_page)
+
+actual_dat<-data.frame(test_dat)
+actual_dat$date<-inds[length(inds)-((pred_window-1):0)]
+actual_dat<-melt(actual_dat,id="date")
+colnames(actual_dat)<-c("date","web_page","page_views")
+actual_dat$web_page<-as.character(actual_dat$web_page)
+
+actual_forecast_dat<-merge(nn_forecast_dat,
+                           actual_dat,by=c("date","web_page"))
+
+save(actual_forecast_dat,
+     file=paste0("./ActualVsForecast_UsingCNN_Data_WebXDay_",start_period,"_",end_period,".RData"))
+
+#Add NN component into forecast
+forecast_series<-t((validation_pred_seq[,,1]*std)+mean)
+
+#Compute accuracy metrics for 64 days ahead without NN approach
+err_by_timestep_withnn<-data.frame()
+for(i in seq(from=7,to=pred_window,by=7)){
+  err<-colMeans(smape(expm1(test_dat[1:i,]),expm1(forecast_series[1:i,])))
+  rmse<-sqrt(mean((expm1(test_dat[1:i,])-expm1(forecast_series[1:i,]))**2,na.rm=TRUE))
+  err_by_timestep_tmp<-cbind(i,mean(err,na.rm=TRUE),median(err),rmse)
+  colnames(err_by_timestep_tmp)<-c("n_step","mean_smape","median_smape","rmse")
+  err_by_timestep_withnn<-rbind(err_by_timestep_withnn,err_by_timestep_tmp)
+}
+
+colnames(err_by_timestep_withnn)[2:ncol(err_by_timestep_withnn)]<-paste0("withNN_",colnames(err_by_timestep_withnn)[2:ncol(err_by_timestep_withnn)])
+
+#Compare metrics for the benefit of a combined approach
+err_by_timestep<-err_by_timestep_withnn
+
+err<-smape(expm1(test_dat),expm1(forecast_series))
+page_err_Withnn<-colMeans(err)
+rmse_withnn<-sqrt(mean((expm1(test_dat)-expm1(forecast_series))**2,na.rm=TRUE))
+
+err_by_timestep$overall_rmse_withtNN<-rmse_withnn
+err_by_timestep$overall_SMAPE_withNN<-mean(page_err_Withnn,na.rm=TRUE)
+err_by_timestep$start_period<-start_period
+err_by_timestep$end_period<-end_period
+
+return(err_by_timestep)
+
+}
+```
+
+
+###Seq. SSA +CNN Model:
+
+This function evaluates Seq. SSA as a standalone approach versus combining it with CNN  
+
+```{r}
+ssa_cnn_combined_model_addnFeat<-function(data,start_period,end_period,pred_window){
+set.seed(123)
+global_inds<-seq(as.Date("2015-07-01"), as.Date("2017-09-10"), by = "day")  
+data<-data[match(start_period,global_inds):match(end_period,global_inds),]
+
+pages_to_remove<-colnames(data)[which(colMeans(is.na(data)) > 0.70)]
+data<-data[,colnames(data)[!colnames(data) %in% pages_to_remove]]
+data<-na.locf(data)
+
+inds <- seq(start_period,end_period, by = "day")
+test_dat<-data[match(end_period,inds)-((pred_window-1):0),]
+train_dat<-data[match(start_period,inds):(match(end_period,inds)-pred_window),]
+rm(global_inds)
+
+# Sequential SSA model-First SSA extracts trend
+# Second model extracts the seasonal components
+# Look at scree plots and eigen vector pairs to identify eigen vectors with similar periods
+# A lower lag here would work as this model primarily extracts trend and lowers computational costs
+lag<-30
+ssa_trend<-ssa(train_dat,kind="mssa",L=lag)
+save(ssa_trend,file=paste0("./SSA_Trend3Comp_FinalModel_AddnFeat_AllData_",start_period,"_",end_period,".RData"))
+# plot(ssa_trend)
+# plot(ssa_trend,type="vectors",idx=1:30)
+# plot(ssa_trend,type="paired",idx=1:29)
+# plot(ssa_trend,type="wcor")
+
+trend_groups<-list(Trend=c(1,2,3))
+reconst_trend <- reconstruct(ssa_trend, groups =trend_groups)
+save(reconst_trend,file=paste0("./SSA_Trend3Comp_Reconst_AddnFeat_AllData_",start_period,"_",end_period,".RData"))
+
+#Residuals from the trend model are fed into a seasonal model to identify periodic components
+# Use a larger lag here to capture more information, on osciallations, for our dataset 60 worked fine
+# General rule: N/2, where N number of observations, say N=365 for 1 year of data
+lag_seasonality<-60
+res_dat<-attr(reconst_trend,"residuals")
+ssa_remaining<-ssa(res_dat,kind="mssa",L=lag_seasonality)
+ save(ssa_remaining,file=paste0("./SSA_Remaining_2Seasons_FinalModel_AddnFeat_AllData_",start_period,"_",end_period,".RData"))
+# plot(ssa_remaining)
+# plot(ssa_remaining,type="vectors",idx=1:50)
+# plot(ssa_remaining,type="paired",idx=1:49)
+# plot(ssa_remaining,type="wcor")
+ 
+season_groups<-list(Season1=c(1,2))
+reconst_seasonality<-reconstruct(ssa_remaining,groups=season_groups)
+ save(reconst_seasonality,file=paste0("./SSA_Seasonal2Comp_Reconst_AddnFeat_AllData_",start_period,"_",end_period,".RData"))
+
+model_noise<-attr(reconst_seasonality,"residuals")
+model_noise[is.na(model_noise) |model_noise==Inf | model_noise==(-Inf)]<-0
+
+vaidate_pred_end<-end_period
+vaidate_pred_start<-vaidate_pred_end-(pred_window-1)
+
+train_pred_end<-vaidate_pred_start-1
+train_pred_start<-train_pred_end-(pred_window-1)
+
+train_start<-start_period
+train_end<-train_pred_start-1
+
+validate_start<-train_start+(pred_window-1)
+validate_end<-train_end+(pred_window-1)
+
+train_res_dat<-model_noise[match(train_start,inds):match(train_end,inds),]
+train_res_dat[is.na(train_res_dat)]<-0
+
+test_res_dat<-model_noise[match(train_pred_start,inds):match(train_pred_end,inds),]
+test_res_dat[is.na(test_res_dat)]<-0
+
+validate_input_res_dat<-model_noise[match(validate_start,inds):match(validate_end,inds),]
+validate_input_res_dat[is.na(validate_input_res_dat)]<-0
+
+encoder_input_data <-train_res_dat
+decoder_target_data<-test_res_dat
+
+encoder_input_data<-cbind(t(encoder_input_data),t(decoder_target_data[1:(nrow(decoder_target_data)-1),]))
+
+median_train_dat<-melt(train_dat)
+median_train_dat$Var1<-NULL
+median_train_dat$Var2<-as.character(median_train_dat$Var2)
+median_train_dat<-median_train_dat%>%
+    group_by(Var2)%>%
+  summarise(median_views=median(value,na.rm=TRUE))
+colnames(median_train_dat)<-c("webpage","median_views")
+median_train_dat$webpage<-as.character(median_train_dat$webpage)
+median_train_dat<-t(median_train_dat)
+colnames(median_train_dat)<-median_train_dat[1,]
+median_train_dat<-median_train_dat[2,]
+median_train_dat<-matrix(rep(as.numeric(median_train_dat),ncol(encoder_input_data)),byrow=TRUE,nrow=ncol(encoder_input_data))
+median_train_dat<-t(median_train_dat)
+
+desktop_traffic<-webpage[webpage %like% "desktop" & names(webpage) %in% colnames(data)]
+desktop_traffic_flag<-matrix(as.integer(1.0),length(desktop_traffic),ncol(encoder_input_data))
+desktop_traffic_flag<-cbind(data.frame(desktop_traffic_flag),names(desktop_traffic))
+colnames(desktop_traffic_flag)[ncol(desktop_traffic_flag)]<-"webpage"
+
+desktop_nottraffic<-webpage[!(webpage %like% "desktop") & names(webpage) %in% colnames(data)]
+desktop_nottraffic_flag<-matrix(as.numeric(0.0),length(desktop_nottraffic),ncol(encoder_input_data))
+desktop_nottraffic_flag<-cbind(data.frame(desktop_nottraffic_flag),names(desktop_nottraffic))
+colnames(desktop_nottraffic_flag)[ncol(desktop_nottraffic_flag)]<-"webpage"
+
+desktop<-rbind(desktop_traffic_flag,desktop_nottraffic_flag)
+rm(desktop_nottraffic_flag,desktop_traffic_flag)
+desktop<-data.frame(desktop)
+desktop<-desktop[order(desktop$webpage),]
+desktop$webpage<-NULL
+desktop<-data.matrix(desktop)
+
+mobile_traffic<-webpage[webpage %like% "mobile-web" & names(webpage) %in% colnames(data)]
+mobile_traffic_flag<-matrix(as.numeric(1.0),length(mobile_traffic),ncol(encoder_input_data))
+mobile_traffic_flag<-cbind(data.frame(mobile_traffic_flag),names(mobile_traffic))
+colnames(mobile_traffic_flag)[ncol(mobile_traffic_flag)]<-"webpage"
+
+mobile_nottraffic<-webpage[!(webpage %like% "mobile-web") & names(webpage) %in% colnames(data)]
+mobile_nottraffic_flag<-matrix(as.numeric(0.0),length(mobile_nottraffic),ncol(encoder_input_data))
+mobile_nottraffic_flag<-cbind(data.frame(mobile_nottraffic_flag),names(mobile_nottraffic))
+colnames(mobile_nottraffic_flag)[ncol(mobile_nottraffic_flag)]<-"webpage"
+
+mobile<-rbind(mobile_traffic_flag,mobile_nottraffic_flag)
+rm(mobile_nottraffic_flag,mobile_traffic_flag)
+mobile<-data.frame(mobile)
+mobile<-mobile[order(mobile$webpage),]
+mobile$webpage<-NULL
+mobile<-data.matrix(mobile)
+
+spider_traffic<-webpage[webpage %like% "spider" & names(webpage) %in% colnames(data)]
+spider_traffic_flag<-matrix(as.numeric(1.0),length(spider_traffic),ncol(encoder_input_data))
+spider_traffic_flag<-cbind(data.frame(spider_traffic_flag),names(spider_traffic))
+colnames(spider_traffic_flag)[ncol(spider_traffic_flag)]<-"webpage"
+
+spider_nottraffic<-webpage[!(webpage %like% "spider") & names(webpage) %in% colnames(data)]
+spider_nottraffic_flag<-matrix(as.numeric(0.0),length(spider_nottraffic),ncol(encoder_input_data))
+spider_nottraffic_flag<-cbind(data.frame(spider_nottraffic_flag),names(spider_nottraffic))
+colnames(spider_nottraffic_flag)[ncol(spider_nottraffic_flag)]<-"webpage"
+
+spider<-rbind(spider_traffic_flag,spider_nottraffic_flag)
+rm(spider_nottraffic_flag,spider_traffic_flag)
+spider<-data.frame(spider)
+spider<-spider[order(spider$webpage),]
+spider$webpage<-NULL
+spider<-data.matrix(spider)
+
+encoder_input_data<-array(c(encoder_input_data,median_train_dat,desktop,mobile,spider),dim=c(nrow(encoder_input_data),ncol(encoder_input_data),5))
+
+decoder_target_data<-array((decoder_target_data),dim=c(ncol(decoder_target_data),nrow(decoder_target_data),1))
+
+rm(model_noise)
+
+k_clear_session()
+n_filters<-32
+filter_width<-7
+dilation_rates<-2**(0:8)
+
+history_seq<-layer_input(shape=list(NULL,5))
+x<-history_seq
+
+for(dilation in dilation_rates){
+  x<-x%>%
+    layer_batch_normalization()%>%
+    layer_conv_1d(filters = n_filters,
+                   kernel_size = filter_width,
+                   padding='causal',
+                   dilation_rate = dilation)
+}
+x<-x%>%
+  layer_batch_normalization()%>%
+  layer_dense(units=256, activation='selu')
+x<-x%>%
+  layer_dropout(0.2)
+x<-x%>%
+  layer_batch_normalization()%>%
+  layer_dense(1)
+
+slice<-function(input,pred_window){
+  return(input[,-pred_window:-1,])
+}
+train_pred_seq<-x%>%
+  layer_lambda(slice,arguments=list('pred_window'=(pred_window)))
+
+model<-keras_model(history_seq,train_pred_seq)
+#summary(model)
+
+gc()
+batch_size<-256
+epochs<-2000
+
+optimize_fn<-optimizer_adam(lr=0.001)
+k_smape_loss<-function(y_true, y_pred){
+  return (k_mean(k_clip(k_abs(y_pred - y_true),0.0,1.0),axis=-1))
+}
+model %>% compile(optimizer=optimize_fn,
+                  loss="mae")
+
+history<-model %>% fit(encoder_input_data,decoder_target_data,
+                        batch_size=batch_size,
+                        epochs=epochs,
+                        validation_split=0.3,callbacks =list(
+                          callback_early_stopping(monitor="val_loss",patience=10)))
+
+export_savedmodel(model,
+                  export_dir_base = paste0("./saveCNNModel_Final_AddnFeat_",start_period,"_",end_period),
+                  remove_learning_phase = FALSE)
+
+#Predict 64 days ahead with the current ensembled model
+pred_fn<-function(model,input_seq){
+  pred_seq<-array(dim=c(nrow(input_seq),(pred_window),1))
+  for(step in 1:(pred_window)){
+    predict_step<-predict(model,input_seq)
+    predict_step<-predict_step[,ncol(predict_step),]
+    predict_step<-array(predict_step,dim=c(length(predict_step),1,1))
+    pred_seq[,step,] <- predict_step
+    #input_seq<-input_seq[,,1]
+    predict_step<-predict_step[,,1]
+    input_seq_new<-cbind(input_seq[,,1],predict_step)
+    input_seq_new2<-cbind(input_seq[,,2],input_seq[,(ncol(input_seq)-1),2])
+    input_seq_new3<-cbind(input_seq[,,3],input_seq[,(ncol(input_seq)-1),3])
+    input_seq_new4<-cbind(input_seq[,,4],input_seq[,(ncol(input_seq)-1),4])
+    input_seq_new5<-cbind(input_seq[,,5],input_seq[,(ncol(input_seq)-1),5])
+    input_seq<-array(c(input_seq_new,input_seq_new2,input_seq_new3,input_seq_new4,input_seq_new5),dim=c(nrow(input_seq_new),ncol(input_seq_new),5))
+  }
+  return(pred_seq)
+}
+
+validation_pred_seq<-pred_fn(model,encoder_input_data)
+
+forecast_trend <- rforecast(ssa_trend, groups = trend_groups,
+                            len = pred_window, only.new = TRUE,
+                            drop.attributes = TRUE,
+                            cache=FALSE,
+                            direction = "column",base="reconstructed")
+
+
+forecast_remaining<- rforecast(ssa_remaining, groups = season_groups,
+                               len = pred_window, only.new = TRUE,
+                               drop.attributes = TRUE,
+                               cache=FALSE,
+                               direction = "column",base="reconstructed")
+
+forecast_series<-forecast_trend+forecast_remaining
+
+trend_dat<-data.frame(forecast_trend)
+colnames(trend_dat)<-colnames(train_dat)
+trend_dat$date<-inds[length(inds)-((pred_window-1):0)]
+trend_dat<-melt(trend_dat,id=c("date"))
+colnames(trend_dat)<-c("date","web_page","page_views_trend")
+trend_dat$web_page<-as.character(trend_dat$web_page)
+
+seasonal1_dat<-data.frame(forecast_remaining)
+colnames(seasonal1_dat)<-colnames(train_dat)
+seasonal1_dat$date<-inds[length(inds)-((pred_window-1):0)]
+seasonal1_dat<-melt(seasonal1_dat,id=c("date"))
+colnames(seasonal1_dat)<-c("date","web_page","page_views_season1")
+seasonal1_dat$web_page<-as.character(seasonal1_dat$web_page)
+
+nn_forecast_dat<-data.frame(t(validation_pred_seq[,,1]))
+colnames(nn_forecast_dat)<-colnames(train_dat)
+nn_forecast_dat$date<-inds[length(inds)-((pred_window-1):0)]
+nn_forecast_dat<-melt(nn_forecast_dat,id=c("date"))
+colnames(nn_forecast_dat)<-c("date","web_page","page_views_remainingComp")
+nn_forecast_dat$web_page<-as.character(nn_forecast_dat$web_page)
+
+
+forecast_dat_breakdown<-merge(trend_dat,
+                           seasonal1_dat,
+                           by=c("date","web_page"))
+
+forecast_dat_breakdown<-merge(forecast_dat_breakdown,
+                           nn_forecast_dat,
+                           by=c("date","web_page"))
+
+actual_dat<-data.frame(test_dat)
+actual_dat$date<-inds[length(inds)-((pred_window-1):0)]
+actual_dat<-melt(actual_dat,id="date")
+colnames(actual_dat)<-c("date","web_page","page_views")
+actual_dat$web_page<-as.character(actual_dat$web_page)
+
+actual_forecast_dat<-merge(forecast_dat_breakdown,
+                           actual_dat,by=c("date","web_page"))
+
+ save(actual_forecast_dat,
+      file=paste0("./ActualVsForecast_AddnFeat_Data_WebXDay_",start_period,"_",end_period,".RData"))
+
+#Compute accuracy metrics for 64 days ahead without NN approach
+err_by_timestep_withoutnn<-data.frame()
+for(i in seq(from=7,to=pred_window,by=7)){
+  err<-colMeans(smape(expm1(test_dat[1:i,]),expm1(forecast_series[1:i,])))
+  rmse<-sqrt(mean((expm1(test_dat[1:i,])-expm1(forecast_series[1:i,]))**2,na.rm=TRUE))
+  err_by_timestep_tmp<-cbind(i,mean(err,na.rm=TRUE),median(err),rmse)
+  colnames(err_by_timestep_tmp)<-c("n_step","mean_smape","median_smape","rmse")
+  err_by_timestep_withoutnn<-rbind(err_by_timestep_withoutnn,err_by_timestep_tmp)
+}
+
+
+colnames(err_by_timestep_withoutnn)[2:ncol(err_by_timestep_withoutnn)]<-paste0("withoutNN_",colnames(err_by_timestep_withoutnn)[2:ncol(err_by_timestep_withoutnn)])
+
+err<-smape(expm1(test_dat),expm1(forecast_series))
+page_err_withoutnn<-colMeans(err)
+rmse_withoutnn<-sqrt(mean((expm1(test_dat)-expm1(forecast_series))**2,na.rm=TRUE))
+
+#Add NN component into forecast
+forecast_series<-forecast_series+t(validation_pred_seq[,,1])
+
+#Compute accuracy metrics for 64 days ahead without NN approach
+err_by_timestep_withnn<-data.frame()
+for(i in seq(from=7,to=pred_window,by=7)){
+  err<-colMeans(smape(expm1(test_dat[1:i,]),expm1(forecast_series[1:i,])))
+  rmse<-sqrt(mean((expm1(test_dat[1:i,])-expm1(forecast_series[1:i,]))**2,na.rm=TRUE))
+  err_by_timestep_tmp<-cbind(i,mean(err,na.rm=TRUE),median(err),rmse)
+  colnames(err_by_timestep_tmp)<-c("n_step","mean_smape","median_smape","rmse")
+  err_by_timestep_withnn<-rbind(err_by_timestep_withnn,err_by_timestep_tmp)
+}
+
+colnames(err_by_timestep_withnn)[2:ncol(err_by_timestep_withnn)]<-paste0("withNN_",colnames(err_by_timestep_withnn)[2:ncol(err_by_timestep_withnn)])
+
+#Compare metrics for the benefit of a combined approach
+err_by_timestep<-merge(err_by_timestep_withoutnn,
+                       err_by_timestep_withnn,by="n_step")
+
+err_by_timestep$overall_SMAPE_withoutNN<-mean(page_err_withoutnn,na.rm=TRUE)
+err_by_timestep$overall_rmse_withoutNN<-rmse_withoutnn
+
+
+err<-smape(expm1(test_dat),expm1(forecast_series))
+page_err_Withnn<-colMeans(err)
+rmse_withnn<-sqrt(mean((expm1(test_dat)-expm1(forecast_series))**2,na.rm=TRUE))
+
+err_by_timestep$overall_rmse_withtNN<-rmse_withnn
+err_by_timestep$overall_SMAPE_withNN<-mean(page_err_Withnn,na.rm=TRUE)
+err_by_timestep$start_period<-start_period
+err_by_timestep$end_period<-end_period
+
+return(err_by_timestep)
+
+}
+```
+
+##Model Validation:
+
+This code chunk does a sliding window cross validation through the data  
+
+```{r}
+load(file="./SSA_WebTraffic_Format_DateXPage_MissingRemoved.RData")
+load(file="./WebPageOrder.RData")
+web_data<-web_data[,colnames(web_data) %in% names(webpage)[webpage %like% "en.wikipedia.org" | webpage %like% "^(desktop|spider|mobile)"]]
+start_inds <- seq(as.Date("2015-07-01"), as.Date("2017-09-10"), by = "64 days")
+webtraffic_ts_data<-ts(data.matrix(web_data[,2:ncol(web_data)]),frequency = 365,start=c(2015,as.numeric(format(start_inds[1], "%j"))))
+rm(web_data)
+train_duration<-365
+pred_window<-64
+
+validation_results<-data.frame()
+cnn_validation_results<-data.frame()
+
+validation_results<-ssa_cnn_combined_model_addnFeat(webtraffic_ts_data,
+                       as.Date("2015-07-01"),
+                       as.Date("2017-09-10"),
+                       pred_window)
+
+cnn_validation_results<-cnn_model(webtraffic_ts_data,
+                       as.Date("2015-07-01"),
+                       as.Date("2017-09-10"),
+                       pred_window)
+
+for(start_ind in start_inds){
+start_ind<-as.Date(start_ind)
+if((start_ind+pred_window+train_duration)<as.Date("2017-09-10")){
+print(paste0("validation Period: ",start_ind," - ",(start_ind+pred_window+train_duration)))
+
+results<-ssa_cnn_combined_model_addnFeat(webtraffic_ts_data,
+                       start_ind,
+                       as.Date(start_ind+pred_window+train_duration),
+                       pred_window)
+
+cnn_results<-cnn_model(webtraffic_ts_data,
+                       start_ind,
+                       as.Date(start_ind+pred_window+train_duration),
+                       pred_window)
+validation_results<-rbind(validation_results,results)
+cnn_validation_results<-rbind(cnn_validation_results,cnn_results)
+}else{
+  print("Validation Limit Reached! Terminating Loop")
+  break
+  }
+}
+
+save(validation_results,file="./SSACNNAddnFeat_All_Validation_results.RData")
+
+save(cnn_validation_results,file="./CNN_All_Validation_results.RData")
+
+```
+
+##Results Aggregation:
+
+Combine results from different validation periods and compare them across different forecast horizons  
+
+```{r}
+files<-list.files("./")
+files<-files[files %like% "ActualVsForecast_AddnFeat_Data_WebXDay"]
+validation_results<-data.frame()
+for(filename in files){
+load(paste0("./",filename))
+#print(filename)
+global_inds<-seq(min(actual_forecast_dat$date), max(actual_forecast_dat$date), by = "7 days")  
+
+actual_forecast_dat$page_views_forecast<-actual_forecast_dat$page_views_trend+
+  actual_forecast_dat$page_views_season1+
+  actual_forecast_dat$page_views_remainingComp
+
+actual_forecast_dat$smape<-smape(expm1(actual_forecast_dat$page_views),
+                                 expm1(actual_forecast_dat$page_views_forecast))
+
+actual_forecast_dat$page_views_forecast<-actual_forecast_dat$page_views_trend+
+  actual_forecast_dat$page_views_season1
+actual_forecast_dat$smape_wonn<-smape(expm1(actual_forecast_dat$page_views),
+                                 expm1(actual_forecast_dat$page_views_forecast))
+for(i in global_inds){
+  i<-as.Date(i)
+  #print(i)
+  start_period<-min(actual_forecast_dat$date)
+  end_period<-max(actual_forecast_dat$date)
+  actual_forecast_dat_tmp<-actual_forecast_dat%>%
+    filter(date<=as.Date(i))%>%
+    group_by(web_page)%>%
+    summarise(mean_smape=mean(smape,na.rm=TRUE),
+              mean_smape_wonn=mean(smape_wonn,na.rm=TRUE))
+  validation_results_tmp<-cbind(as.Date(start_period),as.Date(end_period),as.Date(i),mean(actual_forecast_dat_tmp$mean_smape),mean(actual_forecast_dat_tmp$mean_smape_wonn))
+  colnames(validation_results_tmp)<-c("start_period","end_period","n_step","mean_smape_withnn","mean_smape_withoutnn")
+  validation_results<-rbind(validation_results,validation_results_tmp)
+  }
+
+}
+
+validation_results$start_period<-as.Date(validation_results$start_period)
+validation_results$end_period<-as.Date(validation_results$end_period)
+validation_results$n_step<-as.Date(validation_results$n_step)
+
+
+files<-list.files("./")
+files<-files[files %like% "ActualVsForecast_UsingCNN_Data_WebXDay"]
+cnn_validation_results<-data.frame()
+
+for(filename in files){
+  load(paste0("./",filename))
+  #print(filename)
+  global_inds<-seq(min(actual_forecast_dat$date), max(actual_forecast_dat$date), by = "7 days")  
+  
+  actual_forecast_dat$smape_onlynn<-smape(expm1(actual_forecast_dat$page_views),
+                                   expm1(actual_forecast_dat$page_views_nn))
+
+  for(i in global_inds){
+    i<-as.Date(i)
+    #print(i)
+    start_period<-min(actual_forecast_dat$date)
+    end_period<-max(actual_forecast_dat$date)
+    actual_forecast_dat_tmp<-actual_forecast_dat%>%
+      filter(date<=as.Date(i))%>%
+      group_by(web_page)%>%
+      summarise(mean_smape_onlynn=mean(smape_onlynn,na.rm=TRUE))
+    validation_results_tmp<-cbind(as.Date(start_period),as.Date(end_period),as.Date(i),
+                                  mean(actual_forecast_dat_tmp$mean_smape_onlynn))
+    colnames(validation_results_tmp)<-c("start_period","end_period","n_step","mean_smape_onlynn")
+    cnn_validation_results<-rbind(cnn_validation_results,validation_results_tmp)
+  }
+  
+}
+
+cnn_validation_results$start_period<-as.Date(cnn_validation_results$start_period)
+cnn_validation_results$end_period<-as.Date(cnn_validation_results$end_period)
+cnn_validation_results$n_step<-as.Date(cnn_validation_results$n_step)
+
+new_validation_results<-merge(validation_results,cnn_validation_results,
+                              by=c("start_period","end_period","n_step"))
+save(new_validation_results,file="./ValidationResults.RData")
+
+
+new_validation_results$n_step_time<-new_validation_results$n_step-new_validation_results$start_period
+new_validation_results$n_step<-NULL
+
+new_validation_results<-new_validation_results%>%
+  gather(metric,smape,-start_period,-end_period,-n_step_time)%>%
+  spread(n_step_time,smape)
+
+write.csv(new_validation_results,"./Validation_Results.csv")
+
+```
+
+**Histogram of page wise SMAPE for the latest validation perion 2017-07-09 to 2017-09-10, trained on 2015-07-01 to 2017-07-08 data**    
+```{r}
+files<-list.files("./")
+file<-files[files %like% "ActualVsForecast_AddnFeat_Data_WebXDay_2015-07-01_2017-09-10"]
+load(file=paste0("./",files[length(file)]))
+actual_forecast_dat$forecast_views<-actual_forecast_dat$page_views_trend+
+  actual_forecast_dat$page_views_season1+
+  actual_forecast_dat$page_views_remainingComp
+actual_forecast_dat$smape_err<-smape(expm1(actual_forecast_dat$page_views),
+                                     expm1(actual_forecast_dat$forecast_views))
+
+page_err<-actual_forecast_dat%>%
+  group_by(web_page)%>%
+  summarise(mean_smape=mean(smape_err,na.rm=TRUE))
+
+#Histogram of page wise SMAPE
+ggplot(page_err)+
+  aes(x=mean_smape)+
+  geom_histogram(fill="#0066CC")+
+  xlab("Avg. SMAPE for forecast horizon=64 days")+
+  ylab("# of pages")
+
+#Mean SMAPE
+mean(page_err$mean_smape,na.rm=TRUE)
+#Median SMAPE
+median(page_err$mean_smape,na.rm=TRUE)
+```
+
+**Plot of top 5 webtraffic sites actual vs forecast for the latest validation perion 2017-07-09 to 2017-09-10, trained on 2015-07-01 to 2017-07-08 data**   
+```{r}
+load(file="./ActualVsForecast_AddnFeat_Data_WebXDay_2015-07-01_2017-09-10.RData")
+load(file="./ENG_WebPage_Summary_Views.RData")
+load(file="./WebPageOrder.RData")
+#Uncomment this code to check actual vs forecast for pages that are not main/special and accessed by non-spider agents from any device
+# web_page_summary_dat<-web_page_summary_dat[!web_page_summary_dat$webcode %like% "Main" &
+#                                              !web_page_summary_dat$webcode %like% "Special" &
+#                                              web_page_summary_dat$webcode %like% "all-access" &
+#                                              web_page_summary_dat$webcode %like% "all-agent", ]
+top10<-head(web_page_summary_dat$webcode[order(-web_page_summary_dat$median_dailyviews)],5)
+top10_webcode<-names(webpage[webpage %in% top10])
+
+global_inds<-seq(as.Date("2015-07-01"), as.Date("2017-09-10"), by = "day") 
+plot_all_dat<-data.frame()
+for(webcode in top10_webcode){
+  full_data<-webtraffic_ts_data[match(as.Date("2016-05-16"),global_inds):match(as.Date("2017-07-19"),global_inds),webcode]
+  forecast_data<-actual_forecast_dat[actual_forecast_dat$web_page==webcode,]
+  forecast_data$forecast_views<-forecast_data$page_views_trend+
+    forecast_data$page_views_season1+
+    forecast_data$page_views_remainingComp
+  pred_dat<-c(rep(NA,length(full_data)-64),forecast_data$forecast_views)
+plot_dat<-cbind(global_inds[match(as.Date("2016-05-16"),global_inds):match(as.Date("2017-07-19"),global_inds)],full_data,pred_dat)
+colnames(plot_dat)<-c("Date","Actual","Forecast")
+plot_dat<-data.frame(plot_dat)
+plot_dat$Date<-as.Date(plot_dat$Date)  
+plot_dat$webcode<-webpage[names(webpage)==webcode]
+plot_all_dat<-rbind(plot_all_dat,plot_dat)
+}
+
+plot_all_dat<-plot_all_dat%>%
+  gather(Measure,Value,-Date,-webcode)
+ggplot(data=plot_all_dat)+
+  aes(x=Date,y=Value,color=Measure)+
+  geom_line()+
+  facet_wrap(~webcode,scales ="free")
+
+```
