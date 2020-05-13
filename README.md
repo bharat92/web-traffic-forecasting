@@ -1,7 +1,7 @@
 # STA2202 - Time Series Analysis
 ## Web Traffic Forecasting Using Singular Spectrum Analysis and Neural Networks
 
-### Introduction
+### Project Overview
 <p align="justify">
 Time series data has been increasingly made available at real-time for analysis, and forecasting for multiple series can now benefit from leveraging real-world temporal and spatial correlations. However, this poses a challenge as the number of features that need to be considered could be extremely large, larger than the number of observations available. The literature of time series forecasting has several research proposing modelling techniques to efficiently forecast multiple time series data in high dimensional spaces using techniques such as clustering, principal component analysis and neural networks.
 </p>
