@@ -12,5 +12,5 @@ Time series data has been increasingly made available at real-time for analysis,
 For the purpose of illustraton, a subset of Wikipedia web-traffic page (source: [Kaggle Competition](https://www.kaggle.com/c/web-traffic-time-series-forecasting/data)) s is used and the performance of different approaches is compared against a baseline Univariate ARIMA model.
 </p>
 <p align="justify">
-<b>Note:>/b> This project folder is structured into three sub-folders for data, codes and final summary report of analysis. All of the analysis was done using R.
+<b>Note:</b> This project folder is structured into three sub-folders for data, codes and final summary report of analysis. All of the analysis was done using R.
  </p>
