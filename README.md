@@ -9,7 +9,7 @@ Time series data has been increasingly made available at real-time for analysis,
  In this project, Singular Spectrum Analysis and Neural networks is explored as an approach for multiple web-traffic time series forecasting. The techniques chosen for exploration leverages correlations both within and across different series and have minimal computational and memory requirements.
 </p>
 <p align="justify">
-For the purpose of illustraton, a subset of Wikipedia web-traffic page (source: <a href ="https://www.kaggle.com/c/web-traffic-time-series-forecasting/data">Kaggle Competition </a>) s is used and the performance of different approaches is compared against a baseline Univariate ARIMA model.
+For the purpose of illustraton, a subset of Wikipedia web-traffic page (source: <a href ="https://www.kaggle.com/c/web-traffic-time-series-forecasting/data">Kaggle Competition</a>) is used and the performance of different approaches is compared against a baseline Univariate ARIMA model.
 </p>
 <p align="justify">
 <b>Note:</b> This project folder is structured into three sub-folders for data, codes and final summary report of analysis. All of the analysis was done using R.
